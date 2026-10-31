@@ -1,5 +1,6 @@
 import { googleGsc } from '@openpanel/auth';
 import { db, encrypt } from '@openpanel/db';
+import { gscQueue } from '@openpanel/queue';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { LogError } from '@/utils/errors';
@@ -117,7 +118,7 @@ export async function gscGoogleCallback(
       });
     }
 
-    await db.gscConnection.upsert({
+    const connection = await db.gscConnection.upsert({
       where: { projectId: projectIdStr },
       create: {
         projectId: projectIdStr,
@@ -134,6 +135,20 @@ export async function gscGoogleCallback(
         lastSyncError: null,
       },
     });
+
+    // A reconnect can follow days or weeks of failed nightly syncs. The regular
+    // job only refreshes a rolling three-day window, so enqueue a full backfill
+    // for an existing property to close the historical gap automatically.
+    if (connection.siteUrl) {
+      await db.gscConnection.update({
+        where: { projectId: projectIdStr },
+        data: { backfillStatus: 'pending' },
+      });
+      await gscQueue.add('gscProjectBackfill', {
+        type: 'gscProjectBackfill',
+        payload: { projectId: projectIdStr },
+      });
+    }
 
     reply.clearCookie('gsc_oauth_state');
     reply.clearCookie('gsc_code_verifier');
